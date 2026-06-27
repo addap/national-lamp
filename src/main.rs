@@ -60,31 +60,37 @@ impl LEDChar {
 static LED0: AtomicU32 = AtomicU32::new(0);
 static LED1: AtomicU8 = AtomicU8::new(0);
 
-const LED0_OUTPUTS: usize = 4;
-const LED1_OUTPUTS: usize = 1;
+trait LEDModule {
+    const DIGITS: usize;
+}
+struct LEDModule0;
+struct LEDModule1;
 
-const_assert_eq!(LED0_OUTPUTS, size_of_val(&LED0));
-const_assert_eq!(LED1_OUTPUTS, size_of_val(&LED1));
-
-struct LEDStateC<const N: usize> {
-    chars: [LEDChar; N],
+impl LEDModule for LEDModule0 {
+    const DIGITS: usize = 4;
+}
+impl LEDModule for LEDModule1 {
+    const DIGITS: usize = 1;
 }
 
-struct LEDState {
-    led0: LEDStateC<LED0_OUTPUTS>,
-    led1: LEDStateC<LED1_OUTPUTS>,
-}
+const_assert_eq!(LEDModule0::DIGITS, size_of_val(&LED0));
+const_assert_eq!(LEDModule1::DIGITS, size_of_val(&LED1));
 
-impl<const N: usize> LEDStateC<N> {
-    fn to_bytes(self) -> [u8; N] {
-        self.chars.map(|c| c.0)
+struct LEDChars<const N: usize>([LEDChar; N]);
+
+impl<const N: usize> LEDChars<N> {
+    fn to_bytes(&self) -> [u8; N] {
+        self.0.map(|c| c.0)
     }
 
     fn from_bytes(bytes: [u8; N]) -> Self {
-        Self {
-            chars: bytes.map(LEDChar),
-        }
+        Self(bytes.map(LEDChar))
     }
+}
+
+struct LEDState {
+    led0: LEDChars<{ LEDModule0::DIGITS }>,
+    led1: LEDChars<{ LEDModule1::DIGITS }>,
 }
 
 impl LEDState {
@@ -101,8 +107,8 @@ impl LEDState {
         let state1 = LED1.load(SeqCst);
 
         Self {
-            led0: LEDStateC::from_bytes(u32::to_le_bytes(state0)),
-            led1: LEDStateC::from_bytes(u8::to_le_bytes(state1)),
+            led0: LEDChars::from_bytes(u32::to_le_bytes(state0)),
+            led1: LEDChars::from_bytes(u8::to_le_bytes(state1)),
         }
     }
 
@@ -117,10 +123,8 @@ impl LEDState {
         let info = if am_pm { LEDChar::CP } else { LEDChar::CA };
 
         Self {
-            led0: LEDStateC {
-                chars: [h10, h1, m10, m1],
-            },
-            led1: LEDStateC { chars: [info] },
+            led0: LEDChars([h10, h1, m10, m1]),
+            led1: LEDChars([info]),
         }
     }
     fn from_naive_time_24h(time: NaiveTime) -> Self {
@@ -134,51 +138,59 @@ impl LEDState {
         let info = LEDChar::CH;
 
         Self {
-            led0: LEDStateC {
-                chars: [h10, h1, m10, m1],
-            },
-            led1: LEDStateC { chars: [info] },
+            led0: LEDChars([h10, h1, m10, m1]),
+            led1: LEDChars([info]),
         }
     }
 }
+struct LEDSelect<const N: usize>([Output<'static>; N]);
 
-struct LEDResources<'a> {
-    leds: [Output<'a>; 8 * size_of::<LEDChar>()],
-    outputs: [Output<'a>; LED0_OUTPUTS + LED1_OUTPUTS],
+struct LEDPins {
+    pins: [Output<'static>; 8 * size_of::<LEDChar>()],
 }
 
-impl<'a> LEDResources<'a> {
-    async fn show(&mut self, outidx: usize, c: LEDChar) {
+struct LEDResources {
+    pins: LEDPins,
+    select0: LEDSelect<{ LEDModule0::DIGITS }>,
+    select1: LEDSelect<{ LEDModule1::DIGITS }>,
+}
+
+impl LEDPins {
+    async fn show(&mut self, select: &mut Output<'static>, c: LEDChar) {
         let mut bits: u8 = c.0;
 
-        self.outputs[outidx].set_low();
+        select.set_low();
         for idx in 0..8 {
             if bits & 1 != 0 {
-                self.leds[idx].set_high();
+                self.pins[idx].set_high();
             } else {
-                self.leds[idx].set_low();
+                self.pins[idx].set_low();
             }
             bits = bits >> 1;
         }
         // Small delay so that the LEDs can actually light up.
         Timer::after_millis(1).await;
-        self.outputs[outidx].set_high();
+        select.set_high();
     }
 }
 
+fn iterate_2<T, U, const N: usize>(
+    ts: &mut [T; N],
+    us: [U; N],
+) -> impl IntoIterator<Item = (&mut T, U)> {
+    ts.into_iter().zip(us.into_iter())
+}
+
 #[embassy_executor::task]
-async fn led_manager(mut res: LEDResources<'static>) {
+async fn led_manager(mut res: LEDResources) {
     loop {
         let led_state = LEDState::read();
 
-        for (outidx, c) in led_state
-            .led0
-            .chars
-            .into_iter()
-            .chain(led_state.led1.chars.into_iter())
-            .enumerate()
-        {
-            res.show(outidx, c).await;
+        for (select, c) in iterate_2(&mut res.select0.0, led_state.led0.0) {
+            res.pins.show(select, c).await;
+        }
+        for (select, c) in iterate_2(&mut res.select1.0, led_state.led1.0) {
+            res.pins.show(select, c).await;
         }
     }
 }
@@ -219,13 +231,16 @@ async fn main(spawner: Spawner) -> ! {
     let ul = Output::new(p.PIN_14, Level::Low);
     let um = Output::new(p.PIN_15, Level::Low);
 
-    let leds: [Output; 8] = [ll, lm, lr, mm, ul, um, ur, dot];
+    let pins: [Output; 8] = [ll, lm, lr, mm, ul, um, ur, dot];
 
-    let outputs = [
+    let select0 = [
         Output::new(p.PIN_21, Level::High), // X000 0
         Output::new(p.PIN_20, Level::High), // 0X00 0
         Output::new(p.PIN_19, Level::High), // 00X0 0
         Output::new(p.PIN_18, Level::High), // 000X 0
+    ];
+
+    let select1 = [
         Output::new(p.PIN_17, Level::High), // 0000 X
     ];
 
@@ -234,8 +249,14 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(timer(START_TIME).expect("Spawning time manager failed."));
     // Wait until global time is set.
     Timer::after_millis(1).await;
-    spawner
-        .spawn(led_manager(LEDResources { leds, outputs }).expect("Spawning led manager failed."));
+    spawner.spawn(
+        led_manager(LEDResources {
+            pins: LEDPins { pins },
+            select0: LEDSelect(select0),
+            select1: LEDSelect(select1),
+        })
+        .expect("Spawning led manager failed."),
+    );
 
     loop {
         Timer::after_millis(500).await
