@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(generic_const_exprs)]
 
 use core::sync::atomic::{
     AtomicU8, AtomicU32,
@@ -60,8 +61,21 @@ impl LEDChar {
 static LED0: AtomicU32 = AtomicU32::new(0);
 static LED1: AtomicU8 = AtomicU8::new(0);
 
-trait LEDModule {
+trait LEDModule
+where
+    Self: Sized,
+{
     const DIGITS: usize;
+
+    fn iterate_2(
+        selects: &mut LEDSelect<Self>,
+        chars: LEDChars<Self>,
+    ) -> impl IntoIterator<Item = (&mut Output<'static>, LEDChar)>
+    where
+        [(); Self::DIGITS]:,
+    {
+        (&mut selects.0).into_iter().zip(chars.0.into_iter())
+    }
 }
 struct LEDModule0;
 struct LEDModule1;
@@ -76,21 +90,26 @@ impl LEDModule for LEDModule1 {
 const_assert_eq!(LEDModule0::DIGITS, size_of_val(&LED0));
 const_assert_eq!(LEDModule1::DIGITS, size_of_val(&LED1));
 
-struct LEDChars<const N: usize>([LEDChar; N]);
+struct LEDChars<M: LEDModule>([LEDChar; M::DIGITS])
+where
+    [(); M::DIGITS]:;
 
-impl<const N: usize> LEDChars<N> {
-    fn to_bytes(&self) -> [u8; N] {
+impl<M: LEDModule> LEDChars<M>
+where
+    [(); M::DIGITS]:,
+{
+    fn to_bytes(&self) -> [u8; M::DIGITS] {
         self.0.map(|c| c.0)
     }
 
-    fn from_bytes(bytes: [u8; N]) -> Self {
+    fn from_bytes(bytes: [u8; M::DIGITS]) -> Self {
         Self(bytes.map(LEDChar))
     }
 }
 
 struct LEDState {
-    led0: LEDChars<{ LEDModule0::DIGITS }>,
-    led1: LEDChars<{ LEDModule1::DIGITS }>,
+    led0: LEDChars<LEDModule0>,
+    led1: LEDChars<LEDModule1>,
 }
 
 impl LEDState {
@@ -143,7 +162,9 @@ impl LEDState {
         }
     }
 }
-struct LEDSelect<const N: usize>([Output<'static>; N]);
+struct LEDSelect<M: LEDModule>([Output<'static>; M::DIGITS])
+where
+    [(); M::DIGITS]:;
 
 struct LEDPins {
     pins: [Output<'static>; 8 * size_of::<LEDChar>()],
@@ -151,8 +172,8 @@ struct LEDPins {
 
 struct LEDResources {
     pins: LEDPins,
-    select0: LEDSelect<{ LEDModule0::DIGITS }>,
-    select1: LEDSelect<{ LEDModule1::DIGITS }>,
+    select0: LEDSelect<LEDModule0>,
+    select1: LEDSelect<LEDModule1>,
 }
 
 impl LEDPins {
@@ -174,22 +195,15 @@ impl LEDPins {
     }
 }
 
-fn iterate_2<T, U, const N: usize>(
-    ts: &mut [T; N],
-    us: [U; N],
-) -> impl IntoIterator<Item = (&mut T, U)> {
-    ts.into_iter().zip(us.into_iter())
-}
-
 #[embassy_executor::task]
 async fn led_manager(mut res: LEDResources) {
     loop {
         let led_state = LEDState::read();
 
-        for (select, c) in iterate_2(&mut res.select0.0, led_state.led0.0) {
+        for (select, c) in LEDModule0::iterate_2(&mut res.select0, led_state.led0) {
             res.pins.show(select, c).await;
         }
-        for (select, c) in iterate_2(&mut res.select1.0, led_state.led1.0) {
+        for (select, c) in LEDModule1::iterate_2(&mut res.select1, led_state.led1) {
             res.pins.show(select, c).await;
         }
     }
