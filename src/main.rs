@@ -10,6 +10,7 @@ use chrono::{NaiveTime, TimeDelta, Timelike};
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{AnyPin, Level, Output, Pin};
 use embassy_time::{Duration, Timer};
+use static_assertions::const_assert_eq;
 use {defmt_rtt as _, panic_probe as _};
 
 /// We have 8 LEDs per position so we represent the pattern of which LEDs to turn on for each character
@@ -59,13 +60,19 @@ impl LEDChar {
 static LED0: AtomicU32 = AtomicU32::new(0);
 static LED1: AtomicU8 = AtomicU8::new(0);
 
+const LED0_OUTPUTS: usize = 4;
+const LED1_OUTPUTS: usize = 1;
+
+const_assert_eq!(LED0_OUTPUTS, size_of_val(&LED0));
+const_assert_eq!(LED1_OUTPUTS, size_of_val(&LED1));
+
 struct LEDStateC<const N: usize> {
     chars: [LEDChar; N],
 }
 
 struct LEDState {
-    led0: LEDStateC<4>,
-    led1: LEDStateC<1>,
+    led0: LEDStateC<LED0_OUTPUTS>,
+    led1: LEDStateC<LED1_OUTPUTS>,
 }
 
 impl<const N: usize> LEDStateC<N> {
@@ -136,8 +143,8 @@ impl LEDState {
 }
 
 struct LEDResources<'a> {
-    leds: [Output<'a>; 8],
-    outputs: [Output<'a>; 5],
+    leds: [Output<'a>; 8 * size_of::<LEDChar>()],
+    outputs: [Output<'a>; LED0_OUTPUTS + LED1_OUTPUTS],
 }
 
 impl<'a> LEDResources<'a> {
