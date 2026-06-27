@@ -28,8 +28,8 @@ embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"]
 
 cortex-m = { version = "0.7.7" }
 embassy-rp = { version = "0.9", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp2040"] }
-num_enum = { version = "0.7.6", default-features = false }
 chrono = { version = "0.4.45", default-features = false }
+
 [profile.release]
 debug = 2
 lto = true

@@ -10,7 +10,6 @@ use chrono::{NaiveTime, TimeDelta, Timelike};
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{AnyPin, Level, Output, Pin};
 use embassy_time::{Duration, Timer};
-use num_enum::{FromPrimitive, IntoPrimitive};
 use {defmt_rtt as _, panic_probe as _};
 
 /// We have 8 LEDs per position so we represent the pattern of which LEDs to turn on for each character
@@ -18,25 +17,25 @@ use {defmt_rtt as _, panic_probe as _};
 /// The LED output pins are saved in an array and the bit position corresponds to the array entry that is turned on.
 /// [ll, lm, lr, mm, ul, um, ur, dot]
 ///  0   1   2   3   4   5   6   7
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, IntoPrimitive)]
-enum LEDChar {
-    D0 = 0b01110111,
-    D1 = 0b01000100,
-    D2 = 0b01101011,
-    D3 = 0b01101110,
-    D4 = 0b01011100,
-    D5 = 0b00111110,
-    D6 = 0b00111111,
-    D7 = 0b01100100,
-    D8 = 0b01111111,
-    D9 = 0b01111110,
-    CA = 0b11111101,
-    CP = 0b11111001,
-    CH = 0b11011101,
-    Error = 0b10101010,
-    #[num_enum(catch_all)]
-    Generic(u8),
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LEDChar(u8);
+
+impl LEDChar {
+    const D0: Self = Self(0b01110111);
+    const D1: Self = Self(0b01000100);
+    const D2: Self = Self(0b01101011);
+    const D3: Self = Self(0b01101110);
+    const D4: Self = Self(0b01011100);
+    const D5: Self = Self(0b00111110);
+    const D6: Self = Self(0b00111111);
+    const D7: Self = Self(0b01100100);
+    const D8: Self = Self(0b01111111);
+    const D9: Self = Self(0b01111110);
+    const CA: Self = Self(0b11111101);
+    const CP: Self = Self(0b11111001);
+    const CH: Self = Self(0b11011101);
+    const ERROR: Self = Self(0b10101010);
 }
 
 impl LEDChar {
@@ -52,7 +51,7 @@ impl LEDChar {
             7 => Self::D7,
             8 => Self::D8,
             9 => Self::D9,
-            _ => Self::Error,
+            _ => Self::ERROR,
         }
     }
 }
@@ -71,12 +70,12 @@ struct LEDState {
 
 impl<const N: usize> LEDStateC<N> {
     fn to_bytes(self) -> [u8; N] {
-        self.chars.map(u8::from)
+        self.chars.map(|c| c.0)
     }
 
     fn from_bytes(bytes: [u8; N]) -> Self {
         Self {
-            chars: bytes.map(LEDChar::from),
+            chars: bytes.map(LEDChar),
         }
     }
 }
@@ -143,7 +142,7 @@ struct LEDResources<'a> {
 
 impl<'a> LEDResources<'a> {
     async fn show(&mut self, outidx: usize, c: LEDChar) {
-        let mut bits: u8 = c.into();
+        let mut bits: u8 = c.0;
 
         self.outputs[outidx].set_low();
         for idx in 0..8 {
