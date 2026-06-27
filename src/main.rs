@@ -1,0 +1,237 @@
+#![no_std]
+#![no_main]
+
+use core::sync::atomic::{
+    AtomicU8, AtomicU32,
+    Ordering::{Relaxed, SeqCst},
+};
+
+use chrono::{NaiveTime, TimeDelta, Timelike};
+use embassy_executor::Spawner;
+use embassy_rp::gpio::{AnyPin, Level, Output, Pin};
+use embassy_time::{Duration, Timer};
+use num_enum::{FromPrimitive, IntoPrimitive};
+use {defmt_rtt as _, panic_probe as _};
+
+/// We have 8 LEDs per position so we represent the pattern of which LEDs to turn on for each character
+/// by the bitstring of the underlying byte.
+/// The LED output pins are saved in an array and the bit position corresponds to the array entry that is turned on.
+/// [ll, lm, lr, mm, ul, um, ur, dot]
+///  0   1   2   3   4   5   6   7
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, IntoPrimitive)]
+enum LEDChar {
+    D0 = 0b01110111,
+    D1 = 0b01000100,
+    D2 = 0b01101011,
+    D3 = 0b01101110,
+    D4 = 0b01011100,
+    D5 = 0b00111110,
+    D6 = 0b00111111,
+    D7 = 0b01100100,
+    D8 = 0b01111111,
+    D9 = 0b01111110,
+    CA = 0b11111101,
+    CP = 0b11111001,
+    Error = 0b10101010,
+    #[num_enum(catch_all)]
+    Generic(u8),
+}
+
+impl LEDChar {
+    fn from_decimal(val: u32) -> Self {
+        match val {
+            0 => Self::D0,
+            1 => Self::D1,
+            2 => Self::D2,
+            3 => Self::D3,
+            4 => Self::D4,
+            5 => Self::D5,
+            6 => Self::D6,
+            7 => Self::D7,
+            8 => Self::D8,
+            9 => Self::D9,
+            _ => Self::Error,
+        }
+    }
+}
+
+static LED0: AtomicU32 = AtomicU32::new(0);
+static LED1: AtomicU8 = AtomicU8::new(0);
+
+struct LEDState0 {
+    chars: [LEDChar; 4],
+}
+
+// array and unify with the other using const generics
+struct LEDState1 {
+    c: LEDChar,
+}
+
+struct LEDState {
+    led0: LEDState0,
+    led1: LEDState1,
+}
+
+impl LEDState0 {
+    fn write(self) {
+        let state = u32::from_le_bytes(self.chars.map(u8::from));
+        LED0.store(state, SeqCst);
+    }
+
+    fn read() -> Self {
+        let state = LED0.load(SeqCst);
+        let chars = u32::to_le_bytes(state);
+
+        Self {
+            chars: chars.map(LEDChar::from),
+        }
+    }
+}
+
+impl LEDState1 {
+    fn write(self) {
+        let state: u8 = self.c.into();
+        LED1.store(state, SeqCst);
+    }
+
+    fn read() -> Self {
+        let state = LED1.load(SeqCst);
+
+        Self {
+            c: LEDChar::from(state),
+        }
+    }
+}
+
+impl LEDState {
+    fn write(self) {
+        self.led0.write();
+        self.led1.write();
+    }
+
+    fn read() -> Self {
+        Self {
+            led0: LEDState0::read(),
+            led1: LEDState1::read(),
+        }
+    }
+
+    fn from_naive_time(time: NaiveTime) -> Self {
+        let (am_pm, hh) = time.hour12();
+        let mm = time.minute();
+
+        let am_pm = if am_pm { LEDChar::CP } else { LEDChar::CA };
+        let h10 = LEDChar::from_decimal(hh / 10);
+        let h1 = LEDChar::from_decimal(hh % 10);
+        let m10 = LEDChar::from_decimal(mm / 10);
+        let m1 = LEDChar::from_decimal(mm % 10);
+
+        Self {
+            led0: LEDState0 {
+                chars: [h10, h1, m10, m1],
+            },
+            led1: LEDState1 { c: am_pm },
+        }
+    }
+}
+
+struct LEDResources<'a> {
+    leds: [Output<'a>; 8],
+    outputs: [Output<'a>; 5],
+}
+
+impl<'a> LEDResources<'a> {
+    async fn show(&mut self, outidx: usize, c: LEDChar) {
+        let mut bits: u8 = c.into();
+
+        self.outputs[outidx].set_low();
+        for idx in 0..8 {
+            if bits & 1 != 0 {
+                self.leds[idx].set_high();
+            } else {
+                self.leds[idx].set_low();
+            }
+            bits = bits >> 1;
+        }
+        // Small delay so that the LEDs can actually light up.
+        Timer::after_millis(1).await;
+        self.outputs[outidx].set_high();
+    }
+}
+
+#[embassy_executor::task]
+async fn led_manager(mut res: LEDResources<'static>) {
+    loop {
+        let led_state = LEDState::read();
+
+        for (outidx, c) in led_state
+            .led0
+            .chars
+            .into_iter()
+            .chain([led_state.led1.c])
+            .enumerate()
+        {
+            res.show(outidx, c).await;
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn timer(start: NaiveTime) {
+    const ONE_MINUTE: TimeDelta = TimeDelta::try_minutes(1).expect("ONE_MINUTE malformed.");
+    let mut current_time = start;
+
+    loop {
+        LEDState::from_naive_time(current_time).write();
+        Timer::after_secs(60).await;
+        current_time = current_time.overflowing_add_signed(ONE_MINUTE).0;
+    }
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) -> ! {
+    let p = embassy_rp::init(Default::default());
+
+    /* The Pin to LED mapping for each of the digit blocks is:
+     *      15
+     *    ┌────┐
+     *    │    │
+     *  14│    │13
+     *    ├────┤
+     *    │ 12 │
+     *   8│    │11 ┌┐
+     *    └────┘   └┘
+     *      9      10
+     * */
+    let ll = Output::new(p.PIN_8, Level::Low);
+    let lm = Output::new(p.PIN_9, Level::Low);
+    let dot = Output::new(p.PIN_10, Level::Low);
+    let lr = Output::new(p.PIN_11, Level::Low);
+    let mm = Output::new(p.PIN_12, Level::Low);
+    let ur = Output::new(p.PIN_13, Level::Low);
+    let ul = Output::new(p.PIN_14, Level::Low);
+    let um = Output::new(p.PIN_15, Level::Low);
+
+    let leds: [Output; 8] = [ll, lm, lr, mm, ul, um, ur, dot];
+
+    let outputs = [
+        Output::new(p.PIN_21, Level::High), // X000 0
+        Output::new(p.PIN_20, Level::High), // 0X00 0
+        Output::new(p.PIN_19, Level::High), // 00X0 0
+        Output::new(p.PIN_18, Level::High), // 000X 0
+        Output::new(p.PIN_17, Level::High), // 0000 X
+    ];
+
+    const START_TIME: NaiveTime =
+        NaiveTime::from_hms_opt(00, 00, 00).expect("START_TIME malformed.");
+    spawner.spawn(timer(START_TIME).expect("Spawning time manager failed."));
+    // Wait until global time is set.
+    Timer::after_millis(1).await;
+    spawner
+        .spawn(led_manager(LEDResources { leds, outputs }).expect("Spawning led manager failed."));
+
+    loop {
+        Timer::after_millis(500).await
+    }
+}
