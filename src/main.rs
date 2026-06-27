@@ -33,6 +33,7 @@ enum LEDChar {
     D9 = 0b01111110,
     CA = 0b11111101,
     CP = 0b11111001,
+    CH = 0b11011101,
     Error = 0b10101010,
     #[num_enum(catch_all)]
     Generic(u8),
@@ -59,79 +60,78 @@ impl LEDChar {
 static LED0: AtomicU32 = AtomicU32::new(0);
 static LED1: AtomicU8 = AtomicU8::new(0);
 
-struct LEDState0 {
-    chars: [LEDChar; 4],
-}
-
-// array and unify with the other using const generics
-struct LEDState1 {
-    c: LEDChar,
+struct LEDStateC<const N: usize> {
+    chars: [LEDChar; N],
 }
 
 struct LEDState {
-    led0: LEDState0,
-    led1: LEDState1,
+    led0: LEDStateC<4>,
+    led1: LEDStateC<1>,
 }
 
-impl LEDState0 {
-    fn write(self) {
-        let state = u32::from_le_bytes(self.chars.map(u8::from));
-        LED0.store(state, SeqCst);
+impl<const N: usize> LEDStateC<N> {
+    fn to_bytes(self) -> [u8; N] {
+        self.chars.map(u8::from)
     }
 
-    fn read() -> Self {
-        let state = LED0.load(SeqCst);
-        let chars = u32::to_le_bytes(state);
-
+    fn from_bytes(bytes: [u8; N]) -> Self {
         Self {
-            chars: chars.map(LEDChar::from),
-        }
-    }
-}
-
-impl LEDState1 {
-    fn write(self) {
-        let state: u8 = self.c.into();
-        LED1.store(state, SeqCst);
-    }
-
-    fn read() -> Self {
-        let state = LED1.load(SeqCst);
-
-        Self {
-            c: LEDChar::from(state),
+            chars: bytes.map(LEDChar::from),
         }
     }
 }
 
 impl LEDState {
     fn write(self) {
-        self.led0.write();
-        self.led1.write();
+        let state0 = u32::from_le_bytes(self.led0.to_bytes());
+        let state1 = u8::from_le_bytes(self.led1.to_bytes());
+
+        LED0.store(state0, SeqCst);
+        LED1.store(state1, SeqCst);
     }
 
     fn read() -> Self {
+        let state0 = LED0.load(SeqCst);
+        let state1 = LED1.load(SeqCst);
+
         Self {
-            led0: LEDState0::read(),
-            led1: LEDState1::read(),
+            led0: LEDStateC::from_bytes(u32::to_le_bytes(state0)),
+            led1: LEDStateC::from_bytes(u8::to_le_bytes(state1)),
         }
     }
 
-    fn from_naive_time(time: NaiveTime) -> Self {
+    fn from_naive_time_12h(time: NaiveTime) -> Self {
         let (am_pm, hh) = time.hour12();
         let mm = time.minute();
 
-        let am_pm = if am_pm { LEDChar::CP } else { LEDChar::CA };
         let h10 = LEDChar::from_decimal(hh / 10);
         let h1 = LEDChar::from_decimal(hh % 10);
         let m10 = LEDChar::from_decimal(mm / 10);
         let m1 = LEDChar::from_decimal(mm % 10);
+        let info = if am_pm { LEDChar::CP } else { LEDChar::CA };
 
         Self {
-            led0: LEDState0 {
+            led0: LEDStateC {
                 chars: [h10, h1, m10, m1],
             },
-            led1: LEDState1 { c: am_pm },
+            led1: LEDStateC { chars: [info] },
+        }
+    }
+    fn from_naive_time_24h(time: NaiveTime) -> Self {
+        let hh = time.hour();
+        let mm = time.minute();
+
+        let h10 = LEDChar::from_decimal(hh / 10);
+        let h1 = LEDChar::from_decimal(hh % 10);
+        let m10 = LEDChar::from_decimal(mm / 10);
+        let m1 = LEDChar::from_decimal(mm % 10);
+        let info = LEDChar::CH;
+
+        Self {
+            led0: LEDStateC {
+                chars: [h10, h1, m10, m1],
+            },
+            led1: LEDStateC { chars: [info] },
         }
     }
 }
@@ -169,7 +169,7 @@ async fn led_manager(mut res: LEDResources<'static>) {
             .led0
             .chars
             .into_iter()
-            .chain([led_state.led1.c])
+            .chain(led_state.led1.chars.into_iter())
             .enumerate()
         {
             res.show(outidx, c).await;
@@ -183,7 +183,7 @@ async fn timer(start: NaiveTime) {
     let mut current_time = start;
 
     loop {
-        LEDState::from_naive_time(current_time).write();
+        LEDState::from_naive_time_24h(current_time).write();
         Timer::after_secs(60).await;
         current_time = current_time.overflowing_add_signed(ONE_MINUTE).0;
     }
@@ -224,7 +224,7 @@ async fn main(spawner: Spawner) -> ! {
     ];
 
     const START_TIME: NaiveTime =
-        NaiveTime::from_hms_opt(00, 00, 00).expect("START_TIME malformed.");
+        NaiveTime::from_hms_opt(14, 37, 00).expect("START_TIME malformed.");
     spawner.spawn(timer(START_TIME).expect("Spawning time manager failed."));
     // Wait until global time is set.
     Timer::after_millis(1).await;
