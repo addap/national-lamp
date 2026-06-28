@@ -4,8 +4,14 @@
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering::SeqCst};
 
 use chrono::{NaiveTime, TimeDelta, Timelike};
+use defmt::*;
 use embassy_executor::Spawner;
-use embassy_rp::gpio::{Level, Output};
+use embassy_rp::{
+    bind_interrupts,
+    flash::{self, ERASE_SIZE, FLASH_BASE},
+    gpio::{Level, Output},
+    peripherals::{DMA_CH0, FLASH},
+};
 use embassy_time::Timer;
 use static_assertions::const_assert_eq;
 use {defmt_rtt as _, panic_probe as _};
@@ -176,21 +182,150 @@ async fn led_manager(mut res: LEDResources) {
 }
 
 #[embassy_executor::task]
-async fn timer(start: NaiveTime) {
+async fn timer(
+    start_state: NonvolatileState,
+    mut flash: embassy_rp::flash::Flash<'static, FLASH, flash::Async, FLASH_SIZE>,
+) {
     const ONE_MINUTE: TimeDelta = TimeDelta::try_minutes(1).expect("ONE_MINUTE malformed.");
-    let mut current_time = start;
+    let mut current_state = start_state;
 
     loop {
-        LEDState::from_naive_time_24h(current_time).write();
+        LEDState::from_naive_time_24h(current_state.time).write();
         Timer::after_secs(60).await;
-        current_time = current_time.overflowing_add_signed(ONE_MINUTE).0;
+        current_state.time = current_state.time.overflowing_add_signed(ONE_MINUTE).0;
+
+        // do this during the 1 min wait
+        current_state.write_flash(&mut flash);
+    }
+}
+
+bind_interrupts!(struct Irqs {
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>;
+});
+
+const FLASH_SIZE: usize = 2 * 1024 * 1024;
+
+struct NonvolatileState {
+    time: NaiveTime,
+}
+
+type NonvolatileStateBytes = [u8; 2];
+
+impl NonvolatileState {
+    const TIME_SECTOR_OFFSET: u32 = 0x001ff000;
+    const SLOT_SIZE: usize = size_of::<NonvolatileStateBytes>();
+
+    fn new(time: NaiveTime) -> Self {
+        Self { time }
+    }
+
+    fn from_flash(
+        flash: &mut embassy_rp::flash::Flash<'_, FLASH, flash::Async, FLASH_SIZE>,
+    ) -> Option<Self> {
+        // Get JEDEC id
+        let jedec = flash.blocking_jedec_id().unwrap();
+        info!("jedec id: 0x{:x}", jedec);
+
+        // Get unique id
+        let mut uid = [0; 8];
+        flash.blocking_unique_id(&mut uid).unwrap();
+        info!("unique id: {:?}", uid);
+
+        let mut buf = [0u8; Self::SLOT_SIZE];
+        let mut val = None;
+
+        for slot in 0..(ERASE_SIZE / Self::SLOT_SIZE) {
+            let offset = Self::TIME_SECTOR_OFFSET + (slot * Self::SLOT_SIZE) as u32;
+
+            info!(
+                "Try to read time value from {:x}",
+                offset + FLASH_BASE as u32
+            );
+            defmt::unwrap!(flash.blocking_read(offset, &mut buf));
+
+            info!("Contents start with {=[u8]}", buf);
+
+            if buf == [0xff, 0xff] {
+                info!("Slot #{} is empty. Use latest good value.", slot);
+                // Empty slot. Afterwards nothing should be written.
+                break;
+            }
+            if let Some(time) = NaiveTime::from_hms_opt(buf[0] as u32, buf[1] as u32, 0) {
+                val = Some(Self { time })
+            } else {
+                warn!("Malformed data. Erase entire block and use latest good value.");
+                defmt::unwrap!(flash.blocking_erase(
+                    Self::TIME_SECTOR_OFFSET,
+                    Self::TIME_SECTOR_OFFSET + ERASE_SIZE as u32
+                ));
+                break;
+            }
+        }
+
+        val
+    }
+
+    fn write_flash(
+        &self,
+        flash: &mut embassy_rp::flash::Flash<'_, FLASH, flash::Async, FLASH_SIZE>,
+    ) {
+        //
+
+        let mut buf: NonvolatileStateBytes = [0u8; Self::SLOT_SIZE];
+        let val: NonvolatileStateBytes = [self.time.hour() as u8, self.time.minute() as u8];
+
+        let mut write_offset = None;
+
+        for slot in 0..(ERASE_SIZE / Self::SLOT_SIZE) {
+            let offset = Self::TIME_SECTOR_OFFSET + (slot * Self::SLOT_SIZE) as u32;
+
+            info!(
+                "Try to read time value from {:x}",
+                offset + FLASH_BASE as u32
+            );
+            defmt::unwrap!(flash.blocking_read(offset, &mut buf));
+
+            info!("Contents start with {=[u8]}", buf);
+
+            if buf == [0xff, 0xff] {
+                info!("Slot #{} is empty. Write here.", slot);
+                write_offset = Some(offset);
+                break;
+            }
+            if NaiveTime::from_hms_opt(buf[0] as u32, buf[1] as u32, 0).is_none() {
+                warn!("Malformed data. Erase entire sector and write into first slot.");
+                defmt::unwrap!(flash.blocking_erase(
+                    Self::TIME_SECTOR_OFFSET,
+                    Self::TIME_SECTOR_OFFSET + ERASE_SIZE as u32
+                ));
+                write_offset = Some(Self::TIME_SECTOR_OFFSET);
+                break;
+            }
+        }
+
+        let write_offset = write_offset.unwrap_or_else(|| {
+            warn!("Time sector full. Erase and start from the beginning.");
+            defmt::unwrap!(flash.blocking_erase(
+                Self::TIME_SECTOR_OFFSET,
+                Self::TIME_SECTOR_OFFSET + ERASE_SIZE as u32
+            ));
+            Self::TIME_SECTOR_OFFSET
+        });
+
+        info!(
+            "Write current time to {:X}",
+            write_offset + FLASH_BASE as u32
+        );
+        unwrap!(flash.blocking_write(write_offset, &val))
     }
 }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) -> ! {
     let p = embassy_rp::init(Default::default());
+    info!("Start main task.");
 
+    trace!("Initialize LED segment pins.");
     /* The Pin to LED mapping for each of the digit blocks is:
      *      15
      *    ┌────┐
@@ -213,6 +348,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let segments = LEDSegments([ll, lm, lr, mm, ul, um, ur, dot]);
 
+    trace!("Initialize LED segment pins.");
     let selects = [
         Output::new(p.PIN_21, Level::High), // X000 0
         Output::new(p.PIN_20, Level::High), // 0X00 0
@@ -221,9 +357,19 @@ async fn main(spawner: Spawner) -> ! {
         Output::new(p.PIN_17, Level::High), // 0000 X
     ];
 
-    const START_TIME: NaiveTime =
-        NaiveTime::from_hms_opt(14, 37, 00).expect("START_TIME malformed.");
-    spawner.spawn(timer(START_TIME).expect("Spawning time manager failed."));
+    // restore saved time
+    let mut flash =
+        embassy_rp::flash::Flash::<_, flash::Async, FLASH_SIZE>::new(p.FLASH, p.DMA_CH0, Irqs);
+
+    let initial_state = NonvolatileState::from_flash(&mut flash);
+
+    const DEFAULT_TIME: NaiveTime =
+        NaiveTime::from_hms_opt(14, 37, 00).expect("DEFAULT_TIME malformed.");
+    let start_state: NonvolatileState = initial_state.unwrap_or_else(|| {
+        warn!("initial_state time malformed. Using default instead.",);
+        NonvolatileState::new(DEFAULT_TIME)
+    });
+    spawner.spawn(timer(start_state, flash).expect("Spawning time manager failed."));
     // Wait until global time is set.
     Timer::after_millis(1).await;
     spawner.spawn(
