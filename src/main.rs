@@ -9,7 +9,8 @@ use core::sync::atomic::{
 
 use chrono::{NaiveTime, TimeDelta, Timelike};
 use embassy_executor::Spawner;
-use embassy_rp::gpio::{AnyPin, Level, Output, Pin};
+use embassy_futures::select::{Either, select, select3};
+use embassy_rp::gpio::{AnyPin, Input, Level, Output, Pin, Pull};
 use embassy_time::{Duration, Timer};
 use static_assertions::const_assert_eq;
 use {defmt_rtt as _, panic_probe as _};
@@ -166,9 +167,7 @@ struct LEDSelect<M: LEDModule>([Output<'static>; M::DIGITS])
 where
     [(); M::DIGITS]:;
 
-struct LEDPins {
-    pins: [Output<'static>; 8 * size_of::<LEDChar>()],
-}
+struct LEDPins([Output<'static>; 8 * size_of::<LEDChar>()]);
 
 struct LEDResources {
     pins: LEDPins,
@@ -183,9 +182,9 @@ impl LEDPins {
         select.set_low();
         for idx in 0..8 {
             if bits & 1 != 0 {
-                self.pins[idx].set_high();
+                self.0[idx].set_high();
             } else {
-                self.pins[idx].set_low();
+                self.0[idx].set_low();
             }
             bits = bits >> 1;
         }
@@ -221,6 +220,34 @@ async fn timer(start: NaiveTime) {
     }
 }
 
+enum TimeState {
+    Show,
+    Change,
+}
+
+enum DateState {
+    Show,
+    Change,
+}
+
+enum AlarmState {
+    Show,
+    ChangeTime,
+    ChangeDates,
+}
+
+enum MenuState {
+    Time(TimeState),
+    Date(DateState),
+    Alarm(AlarmState),
+}
+
+impl MenuState {
+    fn new() -> Self {
+        Self::Time(TimeState::Show)
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) -> ! {
     let p = embassy_rp::init(Default::default());
@@ -245,34 +272,49 @@ async fn main(spawner: Spawner) -> ! {
     let ul = Output::new(p.PIN_14, Level::Low);
     let um = Output::new(p.PIN_15, Level::Low);
 
-    let pins: [Output; 8] = [ll, lm, lr, mm, ul, um, ur, dot];
+    let led_pins: [Output; 8] = [ll, lm, lr, mm, ul, um, ur, dot];
 
-    let select0 = [
+    let led_select0 = [
         Output::new(p.PIN_21, Level::High), // X000 0
         Output::new(p.PIN_20, Level::High), // 0X00 0
         Output::new(p.PIN_19, Level::High), // 00X0 0
         Output::new(p.PIN_18, Level::High), // 000X 0
     ];
 
-    let select1 = [
+    let led_select1 = [
         Output::new(p.PIN_17, Level::High), // 0000 X
     ];
 
+    let mut button1 = Input::new(p.PIN_6, Pull::Up);
+    let mut button2 = Input::new(p.PIN_7, Pull::Up);
+
     const START_TIME: NaiveTime =
-        NaiveTime::from_hms_opt(14, 37, 00).expect("START_TIME malformed.");
+        NaiveTime::from_hms_opt(00, 00, 00).expect("START_TIME malformed.");
     spawner.spawn(timer(START_TIME).expect("Spawning time manager failed."));
     // Wait until global time is set.
     Timer::after_millis(1).await;
     spawner.spawn(
         led_manager(LEDResources {
-            pins: LEDPins { pins },
-            select0: LEDSelect(select0),
-            select1: LEDSelect(select1),
+            pins: LEDPins(led_pins),
+            select0: LEDSelect(led_select0),
+            select1: LEDSelect(led_select1),
         })
         .expect("Spawning led manager failed."),
     );
 
+    let mut menu_state = MenuState::new();
     loop {
-        Timer::after_millis(500).await
+        let button_result = select3(
+            button1.wait_for_any_edge(),
+            button2.wait_for_any_edge(),
+            Timer::after_millis(10),
+        )
+        .await;
+
+        match menu_state {
+            MenuState::Time(time_state) => todo!(),
+            MenuState::Date(date_state) => todo!(),
+            MenuState::Alarm(alarm_state) => todo!(),
+        }
     }
 }
